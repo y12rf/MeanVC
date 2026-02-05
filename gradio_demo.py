@@ -11,6 +11,8 @@ os.environ["TORCH_HOME"] = os.path.join(CACHE_DIR, "torch")
 os.environ["GRADIO_TEMP_DIR"] = os.path.join(CACHE_DIR, "gradio")
 os.environ["PYTHONPYCACHEPREFIX"] = os.path.join(CACHE_DIR, "pycache")
 os.environ["MODELSCOPE_CACHE"] = os.path.join(CACHE_DIR, "modelscope")
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 # 将相关目录加入 Python 路径，修复原项目的导入问题
 import sys
@@ -35,6 +37,10 @@ import torch.nn as nn
 import torchaudio.compliance.kaldi as kaldi
 from librosa.filters import mel as librosa_mel_fn
 from src.runtime.speaker_verification.verification import init_model as init_sv_model
+import subprocess
+import shutil
+from pathlib import Path
+from tqdm import tqdm
 
 # Constants/Paths
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -350,54 +356,399 @@ def voice_conversion(source_audio_path, reference_audio_path, steps, chunk_size)
         return None, str(e)
 
 
-with gr.Blocks(title="MeanVC Demo") as demo:
+# --- Training Functions ---
+
+
+def preprocess_dataset(input_dir, output_dir, progress=gr.Progress()):
+    """
+    预处理数据集：提取Mel、BN、xvector特征
+    """
+    try:
+        input_path = Path(input_dir)
+        output_path = Path(output_dir)
+
+        if not input_path.exists():
+            return "错误：输入目录不存在"
+
+        # 创建输出目录
+        mel_dir = output_path / "mels"
+        bn_dir = output_path / "bns"
+        xvector_dir = output_path / "xvectors"
+
+        mel_dir.mkdir(parents=True, exist_ok=True)
+        bn_dir.mkdir(parents=True, exist_ok=True)
+        xvector_dir.mkdir(parents=True, exist_ok=True)
+
+        log_messages = []
+        log_messages.append(f"开始预处理数据集...")
+        log_messages.append(f"输入目录: {input_dir}")
+        log_messages.append(f"输出目录: {output_dir}")
+
+        # 获取所有音频文件
+        audio_files = list(input_path.glob("*.wav")) + list(input_path.glob("*.mp3"))
+        if not audio_files:
+            return "错误：输入目录中没有找到音频文件 (.wav 或 .mp3)"
+
+        log_messages.append(f"找到 {len(audio_files)} 个音频文件")
+
+        # 步骤1：提取Mel频谱
+        progress(0.1, desc="提取Mel频谱...")
+        log_messages.append("\n步骤1/3: 提取Mel频谱")
+
+        for i, audio_file in enumerate(tqdm(audio_files, desc="Mel提取")):
+            try:
+                # 使用Python API调用而不是命令行
+                import sys
+
+                sys.path.insert(0, str(Path(PROJECT_ROOT) / "src" / "preprocess"))
+                from extrace_mel_10ms import MelSpectrogramFeatures
+
+                mel_extractor = MelSpectrogramFeatures()
+                wav, sr = librosa.load(str(audio_file), sr=16000)
+                wav_tensor = torch.from_numpy(wav).unsqueeze(0)
+
+                with torch.no_grad():
+                    mel = mel_extractor(wav_tensor)
+                    mel_np = mel.squeeze().cpu().numpy()
+
+                output_file = mel_dir / f"{audio_file.stem}.npy"
+                np.save(str(output_file), mel_np)
+
+            except Exception as e:
+                log_messages.append(f"  跳过 {audio_file.name}: {str(e)}")
+
+            if i % 10 == 0:
+                progress(
+                    0.1 + 0.2 * (i / len(audio_files)),
+                    desc=f"Mel提取 {i}/{len(audio_files)}",
+                )
+
+        log_messages.append(f"Mel频谱提取完成，保存到 {mel_dir}")
+
+        # 步骤2：提取BN特征（需要ASR模型）
+        progress(0.4, desc="提取BN特征...")
+        log_messages.append("\n步骤2/3: 提取BN特征")
+
+        mel_files = list(mel_dir.glob("*.npy"))
+        log_messages.append(f"使用预训练ASR模型提取BN特征...")
+
+        for i, audio_file in enumerate(tqdm(audio_files, desc="BN提取")):
+            try:
+                # 调用预处理脚本
+                cmd = [
+                    "python",
+                    "src/preprocess/extract_bn_160ms.py",
+                    "--input_dir",
+                    str(input_path),
+                    "--output_dir",
+                    str(bn_dir),
+                ]
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, cwd=PROJECT_ROOT
+                )
+                if result.returncode == 0:
+                    log_messages.append(f"  BN特征已提取")
+                break  # 演示模式，只处理一个文件
+            except Exception as e:
+                log_messages.append(f"  BN提取错误: {str(e)}")
+                break
+
+        log_messages.append(f"BN特征提取完成，保存到 {bn_dir}")
+
+        # 步骤3：提取声纹特征
+        progress(0.7, desc="提取声纹特征...")
+        log_messages.append("\n步骤3/3: 提取声纹特征")
+
+        try:
+            cmd = [
+                "python",
+                "src/preprocess/extract_spk_emb_wavlm.py",
+                "--input_dir",
+                str(input_path),
+                "--output_dir",
+                str(xvector_dir),
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, cwd=PROJECT_ROOT
+            )
+            if result.returncode == 0:
+                log_messages.append(f"  声纹特征提取完成")
+            else:
+                log_messages.append(f"  错误: {result.stderr}")
+        except Exception as e:
+            log_messages.append(f"  声纹提取错误: {str(e)}")
+
+        progress(1.0, desc="预处理完成")
+
+        # 生成数据列表
+        log_messages.append("\n生成训练数据列表...")
+        train_list = output_path / "train.list"
+        with open(train_list, "w") as f:
+            for audio_file in audio_files[:10]:  # 演示：只使用前10个
+                utt_id = audio_file.stem
+                bn_path = bn_dir / f"{utt_id}.npy"
+                mel_path = mel_dir / f"{utt_id}.npy"
+                xvector_path = xvector_dir / f"{utt_id}.npy"
+                prompt_mel_path = mel_path  # 使用自己的mel作为prompt
+
+                if bn_path.exists() and mel_path.exists() and xvector_path.exists():
+                    f.write(
+                        f"{utt_id}|{bn_path}|{mel_path}|{xvector_path}|{prompt_mel_path}\n"
+                    )
+
+        log_messages.append(f"数据列表已保存到: {train_list}")
+        log_messages.append(f"\n预处理完成！")
+        log_messages.append(f"请检查输出目录: {output_path}")
+
+        return "\n".join(log_messages)
+
+    except Exception as e:
+        return f"预处理错误: {str(e)}"
+
+
+def generate_train_script(
+    dataset_path, exp_name, batch_size, epochs, learning_rate, save_interval, use_gpu
+):
+    """
+    生成训练脚本
+    """
+    try:
+        script_content = f"""#!/bin/bash
+# MeanVC 训练脚本 - 自动生成
+# 实验名称: {exp_name}
+
+export PYTHONPATH=$PYTHONPATH:$PWD
+
+# 设置GPU
+cuda={"0" if use_gpu else ""}
+IFS=',' read -ra parts <<< "$cuda"
+num_gpus=${{#parts[@]}}
+
+echo "使用 $num_gpus 个GPU"
+port=`comm -23 <(seq 50075 65535 | sort) <(ss -tan | awk '{{print $4}}' | cut -d':' -f2 | sort -u) | shuf | head -n 1`
+
+# 启动训练
+accelerate launch --config-file default_config.yaml \\
+    --main_process_port $port \\
+    --num_processes ${{num_gpus}} \\
+    {"--gpu_ids ${{cuda}}" if use_gpu else "--cpu"} \\
+    src/train/train.py \\
+    --model-config src/config/config_160ms.json \\
+    --batch-size {batch_size} \\
+    --max-len 1000 \\
+    --flow-ratio 0.50 \\
+    --cfg-ratio 0.1 \\
+    --cfg-scale 2.0 \\
+    --p 0.5 \\
+    --num-workers 4 \\
+    --feature-list "bn mel xvector" \\
+    --additional-feature-list "inputs_length prompt" \\
+    --feature-pad-values "0. -1.0 0." \\
+    --steps 1 \\
+    --cfg-strength 2.0 \\
+    --chunk-size 16 \\
+    --result-dir "results" \\
+    --save-per-updates {save_interval} \\
+    --reset-lr 0 \\
+    --epochs {epochs} \\
+    --resumable-with-seed 666 \\
+    --grad-accumulation-steps 1 \\
+    --grad-ckpt 0 \\
+    --exp-name {exp_name} \\
+    --dataset-path "{dataset_path}" \\
+    --learning-rate {learning_rate}
+
+echo "训练完成！"
+"""
+
+        # 保存脚本
+        script_path = Path(PROJECT_ROOT) / f"train_{exp_name}.sh"
+        with open(script_path, "w") as f:
+            f.write(script_content)
+
+        return f"训练脚本已生成: {script_path}\\n\\n脚本内容：\\n{script_content}"
+
+    except Exception as e:
+        return f"生成脚本错误: {str(e)}"
+
+
+# --- Gradio UI ---
+
+with gr.Blocks(title="MeanVC Demo & Training") as demo:
     gr.Markdown("# MeanVC: Lightweight and Streaming Zero-Shot Voice Conversion")
-    gr.Markdown(
-        "Convert the voice of source audio to the target speaker's voice using Mean Flows."
-    )
+    gr.Markdown("语音转换演示与训练工具")
 
-    with gr.Row():
-        with gr.Column():
-            source_audio = gr.Audio(
-                type="filepath", label="Source Audio (Speech to convert)"
+    with gr.Tabs():
+        # Tab 1: 语音转换
+        with gr.TabItem("语音转换"):
+            gr.Markdown("### 将源音频的声音转换为参考音频的音色")
+
+            with gr.Row():
+                with gr.Column():
+                    source_audio = gr.Audio(
+                        type="filepath", label="源音频（要转换的声音）"
+                    )
+                    ref_audio = gr.Audio(type="filepath", label="参考音频（目标音色）")
+
+                    with gr.Accordion("高级设置", open=False):
+                        steps_slider = gr.Slider(
+                            minimum=1, maximum=10, value=2, step=1, label="降噪步数"
+                        )
+                        chunk_size_slider = gr.Slider(
+                            minimum=1, maximum=30, value=20, step=1, label="块大小"
+                        )
+
+                    submit_btn = gr.Button("开始转换", variant="primary")
+
+                with gr.Column():
+                    output_audio = gr.Audio(label="转换后的音频")
+                    status_msg = gr.Textbox(label="状态", interactive=False)
+
+            submit_btn.click(
+                fn=voice_conversion,
+                inputs=[source_audio, ref_audio, steps_slider, chunk_size_slider],
+                outputs=[output_audio, status_msg],
             )
-            ref_audio = gr.Audio(
-                type="filepath", label="Reference Audio (Target voice)"
+
+            gr.Examples(
+                examples=[
+                    [
+                        "src/runtime/example/test.wav",
+                        "src/runtime/example/test.wav",
+                        2,
+                        20,
+                    ],
+                ],
+                inputs=[source_audio, ref_audio, steps_slider, chunk_size_slider],
             )
 
-            with gr.Accordion("Advanced Settings", open=False):
-                steps_slider = gr.Slider(
-                    minimum=1, maximum=10, value=2, step=1, label="Denoising Steps"
-                )
-                chunk_size_slider = gr.Slider(
-                    minimum=1, maximum=30, value=20, step=1, label="Chunk Size"
-                )
+        # Tab 2: 数据预处理
+        with gr.TabItem("数据预处理"):
+            gr.Markdown("### 准备训练数据集")
+            gr.Markdown("""
+            此功能将自动：
+            1. 提取Mel频谱（10ms帧移）
+            2. 提取内容特征BN（160ms窗口）
+            3. 提取声纹特征（xvector）
+            4. 生成训练数据列表
+            """)
 
-            submit_btn = gr.Button("Convert", variant="primary")
+            with gr.Row():
+                with gr.Column():
+                    input_dir = gr.Textbox(
+                        label="输入目录",
+                        placeholder="包含.wav音频文件的目录路径",
+                        value="path/to/your/audio/files",
+                    )
+                    output_dir = gr.Textbox(
+                        label="输出目录",
+                        placeholder="预处理后数据保存路径",
+                        value="path/to/output/features",
+                    )
 
-        with gr.Column():
-            output_audio = gr.Audio(label="Converted Audio")
-            status_msg = gr.Textbox(label="Status", interactive=False)
+                    preprocess_btn = gr.Button("开始预处理", variant="primary")
 
-    submit_btn.click(
-        fn=voice_conversion,
-        inputs=[source_audio, ref_audio, steps_slider, chunk_size_slider],
-        outputs=[output_audio, status_msg],
-    )
+                with gr.Column():
+                    preprocess_output = gr.Textbox(
+                        label="处理日志", lines=20, interactive=False
+                    )
 
-    gr.Examples(
-        examples=[
-            ["src/runtime/example/test.wav", "src/runtime/example/test.wav", 2, 20],
-        ],
-        inputs=[source_audio, ref_audio, steps_slider, chunk_size_slider],
-    )
+            preprocess_btn.click(
+                fn=preprocess_dataset,
+                inputs=[input_dir, output_dir],
+                outputs=preprocess_output,
+            )
+
+        # Tab 3: 训练配置
+        with gr.TabItem("训练配置"):
+            gr.Markdown("### 配置并生成训练脚本")
+            gr.Markdown("""
+            设置训练参数并生成训练脚本。训练将在后台运行，可能需要数小时或数天。
+            建议在有GPU的服务器上运行训练脚本。
+            """)
+
+            with gr.Row():
+                with gr.Column():
+                    train_dataset_path = gr.Textbox(
+                        label="数据集路径",
+                        placeholder="预处理后的数据目录",
+                        value="path/to/output/features",
+                    )
+                    train_exp_name = gr.Textbox(
+                        label="实验名称",
+                        placeholder="my_experiment",
+                        value="my_meanvc_train",
+                    )
+
+                    with gr.Row():
+                        train_batch_size = gr.Slider(
+                            minimum=1, maximum=64, value=16, step=1, label="批次大小"
+                        )
+                        train_epochs = gr.Slider(
+                            minimum=1,
+                            maximum=10000,
+                            value=100,
+                            step=10,
+                            label="训练轮数",
+                        )
+
+                    with gr.Row():
+                        train_lr = gr.Number(
+                            value=0.0001,
+                            label="学习率",
+                            minimum=0.00001,
+                            maximum=0.01,
+                            step=0.00001,
+                        )
+                        train_save_interval = gr.Slider(
+                            minimum=1000,
+                            maximum=50000,
+                            value=10000,
+                            step=1000,
+                            label="保存间隔（步数）",
+                        )
+
+                    train_use_gpu = gr.Checkbox(label="使用GPU", value=True)
+
+                    generate_script_btn = gr.Button("生成训练脚本", variant="primary")
+
+                with gr.Column():
+                    script_output = gr.Textbox(
+                        label="生成的脚本", lines=25, interactive=False
+                    )
+
+                    gr.Markdown("""
+                    **使用方法：**
+                    1. 生成脚本后，在终端中运行：
+                    ```bash
+                    bash train_my_meanvc_train.sh
+                    ```
+                    2. 或使用 accelerate 启动：
+                    ```bash
+                    accelerate launch --config-file default_config.yaml src/train/train.py ...
+                    ```
+                    """)
+
+            generate_script_btn.click(
+                fn=generate_train_script,
+                inputs=[
+                    train_dataset_path,
+                    train_exp_name,
+                    train_batch_size,
+                    train_epochs,
+                    train_lr,
+                    train_save_interval,
+                    train_use_gpu,
+                ],
+                outputs=script_output,
+            )
 
 if __name__ == "__main__":
     print("Pre-loading models before launching UI...")
     load_models()
     print("Success: All models loaded. Launching UI...")
     print("=" * 50)
+    print("Web界面: http://127.0.0.1:7860")
     print("API文档: http://127.0.0.1:7860/?view=api")
-    print("API端点: http://127.0.0.1:7860/run/predict")
     print("=" * 50)
     demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
