@@ -41,6 +41,11 @@ import subprocess
 import shutil
 from pathlib import Path
 from tqdm import tqdm
+import threading
+import time
+from queue import Queue
+import signal
+import traceback
 
 # Constants/Paths
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -358,6 +363,209 @@ def voice_conversion(source_audio_path, reference_audio_path, steps, chunk_size)
 
 # --- Training Functions ---
 
+# 全局训练状态
+train_stop_flag = False
+train_thread = None
+train_log_queue = Queue()
+
+
+def run_training(
+    dataset_path,
+    exp_name,
+    batch_size,
+    epochs,
+    learning_rate,
+    save_interval,
+    use_gpu,
+):
+    """
+    实际执行训练（简化版，使用命令行调用）
+    """
+    global train_stop_flag
+
+    try:
+        # 检查数据集路径
+        dataset_path = Path(dataset_path)
+        if not dataset_path.exists():
+            yield "❌ 错误：数据集路径不存在"
+            return
+
+        train_list = dataset_path / "train.list"
+        if not train_list.exists():
+            yield "❌ 错误：未找到 train.list 文件，请先进行数据预处理"
+            yield "提示：使用'数据预处理'Tab处理你的音频数据"
+            return
+
+        # 设置实验目录
+        exp_dir = Path(PROJECT_ROOT) / "results" / exp_name
+        exp_dir.mkdir(parents=True, exist_ok=True)
+
+        yield f"✅ 检查通过"
+        yield f"📁 实验名称: {exp_name}"
+        yield f"📂 保存目录: {exp_dir}"
+        yield f"📊 数据集: {dataset_path}"
+
+        # 准备训练命令
+        cuda_devices = "0" if use_gpu and torch.cuda.is_available() else ""
+        if use_gpu and not torch.cuda.is_available():
+            yield "⚠️ 警告：GPU不可用，将使用CPU训练（会非常慢）"
+
+        yield f"\n🚀 启动训练..."
+        yield f"📝 参数: batch_size={batch_size}, epochs={epochs}, lr={learning_rate}"
+
+        # 构建命令
+        cmd = [
+            sys.executable,
+            "src/train/train.py",
+            "--model-config",
+            "src/config/config_160ms.json",
+            "--batch-size",
+            str(batch_size),
+            "--max-len",
+            "1000",
+            "--flow-ratio",
+            "0.50",
+            "--cfg-ratio",
+            "0.1",
+            "--cfg-scale",
+            "2.0",
+            "--p",
+            "0.5",
+            "--num-workers",
+            "4",
+            "--feature-list",
+            "bn mel xvector",
+            "--additional-feature-list",
+            "inputs_length prompt",
+            "--feature-pad-values",
+            "0. -1.0 0.",
+            "--steps",
+            "1",
+            "--cfg-strength",
+            "2.0",
+            "--chunk-size",
+            "16",
+            "--result-dir",
+            str(exp_dir),
+            "--save-per-updates",
+            str(save_interval),
+            "--reset-lr",
+            "0",
+            "--epochs",
+            str(epochs),
+            "--resumable-with-seed",
+            "666",
+            "--grad-accumulation-steps",
+            "1",
+            "--grad-ckpt",
+            "0",
+            "--exp-name",
+            exp_name,
+            "--dataset-path",
+            str(dataset_path),
+            "--learning-rate",
+            str(learning_rate),
+        ]
+
+        # 设置环境变量
+        env = os.environ.copy()
+        env["PYTHONPATH"] = f"{PROJECT_ROOT}:{env.get('PYTHONPATH', '')}"
+        if cuda_devices:
+            env["CUDA_VISIBLE_DEVICES"] = cuda_devices
+
+        yield f"\n{'=' * 50}"
+        yield "训练进行中... (按'停止训练'按钮可中断)"
+        yield f"{'=' * 50}\n"
+
+        # 启动训练进程
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            cwd=PROJECT_ROOT,
+            env=env,
+        )
+
+        # 实时读取输出
+        log_buffer = []
+        while True:
+            # 检查停止标志
+            if train_stop_flag:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except:
+                    process.kill()
+                yield "\n🛑 训练已被用户停止"
+                yield f"💾 检查点可能已保存在: {exp_dir}"
+                break
+
+            # 读取输出
+            try:
+                if process.stdout:
+                    line = process.stdout.readline()
+                    if not line and process.poll() is not None:
+                        break
+
+                    if line:
+                        log_buffer.append(line.strip())
+                        # 只保留最近20行
+                        if len(log_buffer) > 20:
+                            log_buffer = log_buffer[-20:]
+                        yield "\n".join(log_buffer)
+            except:
+                # Windows下可能会有编码问题
+                pass
+
+            # 短暂休眠避免CPU占用过高
+            time.sleep(0.1)
+
+        # 获取返回码
+        return_code = process.poll()
+
+        if return_code == 0:
+            yield f"\n✅ 训练成功完成！"
+            yield f"💾 模型保存在: {exp_dir}"
+        else:
+            yield f"\n❌ 训练失败 (返回码: {return_code})"
+            yield "请检查上面的错误日志"
+
+    except Exception as e:
+        yield f"\n❌ 训练错误: {str(e)}"
+        yield traceback.format_exc()
+
+
+def stop_training():
+    """停止训练"""
+    global train_stop_flag
+    train_stop_flag = True
+    return "正在停止训练..."
+
+
+def start_training_thread(*args):
+    """在后台线程启动训练"""
+    global train_thread, train_stop_flag
+    train_stop_flag = False
+
+    def train_wrapper():
+        for log in run_training(*args):
+            train_log_queue.put(log)
+
+    train_thread = threading.Thread(target=train_wrapper)
+    train_thread.start()
+    return "训练已启动"
+
+
+def get_train_logs():
+    """获取训练日志"""
+    logs = []
+    while not train_log_queue.empty():
+        logs.append(train_log_queue.get())
+    return "\n".join(logs) if logs else ""
+
 
 def preprocess_dataset(input_dir, output_dir, progress=gr.Progress()):
     """
@@ -397,12 +605,7 @@ def preprocess_dataset(input_dir, output_dir, progress=gr.Progress()):
 
         for i, audio_file in enumerate(tqdm(audio_files, desc="Mel提取")):
             try:
-                # 使用Python API调用而不是命令行
-                import sys
-
-                sys.path.insert(0, str(Path(PROJECT_ROOT) / "src" / "preprocess"))
-                from extrace_mel_10ms import MelSpectrogramFeatures
-
+                # 使用已定义的MelSpectrogramFeatures类
                 mel_extractor = MelSpectrogramFeatures()
                 wav, sr = librosa.load(str(audio_file), sr=16000)
                 wav_tensor = torch.from_numpy(wav).unsqueeze(0)
@@ -659,19 +862,19 @@ with gr.Blocks(title="MeanVC Demo & Training") as demo:
                 outputs=preprocess_output,
             )
 
-        # Tab 3: 训练配置
-        with gr.TabItem("训练配置"):
-            gr.Markdown("### 配置并生成训练脚本")
+        # Tab 3: 模型训练
+        with gr.TabItem("模型训练"):
+            gr.Markdown("### 在Gradio中直接训练模型")
             gr.Markdown("""
-            设置训练参数并生成训练脚本。训练将在后台运行，可能需要数小时或数天。
-            建议在有GPU的服务器上运行训练脚本。
+            此功能允许你直接在Web界面中训练MeanVC模型。
+            **注意**：训练会占用较多计算资源，建议在GPU环境下进行。
             """)
 
             with gr.Row():
                 with gr.Column():
                     train_dataset_path = gr.Textbox(
                         label="数据集路径",
-                        placeholder="预处理后的数据目录",
+                        placeholder="预处理后的数据目录（包含train.list）",
                         value="path/to/output/features",
                     )
                     train_exp_name = gr.Textbox(
@@ -686,7 +889,7 @@ with gr.Blocks(title="MeanVC Demo & Training") as demo:
                         )
                         train_epochs = gr.Slider(
                             minimum=1,
-                            maximum=10000,
+                            maximum=1000,
                             value=100,
                             step=10,
                             label="训练轮数",
@@ -701,36 +904,38 @@ with gr.Blocks(title="MeanVC Demo & Training") as demo:
                             step=0.00001,
                         )
                         train_save_interval = gr.Slider(
-                            minimum=1000,
+                            minimum=100,
                             maximum=50000,
-                            value=10000,
-                            step=1000,
+                            value=1000,
+                            step=100,
                             label="保存间隔（步数）",
                         )
 
                     train_use_gpu = gr.Checkbox(label="使用GPU", value=True)
 
-                    generate_script_btn = gr.Button("生成训练脚本", variant="primary")
+                    with gr.Row():
+                        start_train_btn = gr.Button("开始训练", variant="primary")
+                        stop_train_btn = gr.Button("停止训练", variant="stop")
 
                 with gr.Column():
-                    script_output = gr.Textbox(
-                        label="生成的脚本", lines=25, interactive=False
+                    train_output = gr.Textbox(
+                        label="训练日志", lines=20, interactive=False, autoscroll=True
+                    )
+                    train_progress = gr.Slider(
+                        minimum=0, maximum=100, value=0, label="训练进度 (%)"
                     )
 
                     gr.Markdown("""
-                    **使用方法：**
-                    1. 生成脚本后，在终端中运行：
-                    ```bash
-                    bash train_my_meanvc_train.sh
-                    ```
-                    2. 或使用 accelerate 启动：
-                    ```bash
-                    accelerate launch --config-file default_config.yaml src/train/train.py ...
-                    ```
+                    **说明：**
+                    - 点击"开始训练"启动训练过程
+                    - 训练过程中会实时显示损失值和进度
+                    - 可随时点击"停止训练"中断（会保存已训练的权重）
+                    - 训练结果保存在 `results/{实验名称}/` 目录
                     """)
 
-            generate_script_btn.click(
-                fn=generate_train_script,
+            # 绑定按钮事件
+            start_train_btn.click(
+                fn=run_training,
                 inputs=[
                     train_dataset_path,
                     train_exp_name,
@@ -740,7 +945,12 @@ with gr.Blocks(title="MeanVC Demo & Training") as demo:
                     train_save_interval,
                     train_use_gpu,
                 ],
-                outputs=script_output,
+                outputs=train_output,
+            )
+
+            stop_train_btn.click(
+                fn=stop_training,
+                outputs=train_output,
             )
 
 if __name__ == "__main__":

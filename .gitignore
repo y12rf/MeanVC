@@ -42,3 +42,11 @@ nul
 *.mp3
 *.wav
 !src/runtime/example/*.wav
+
+# Training outputs
+results/
+ckpts/
+*.ckpt
+
+# Wandb logs
+wandb/
