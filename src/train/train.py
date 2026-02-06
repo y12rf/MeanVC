@@ -1,6 +1,6 @@
 # training script.
 
-from importlib.resources import files
+from pathlib import Path
 
 from src.model import DiT, Trainer
 
@@ -37,6 +37,9 @@ def main():
     print("Total parameters: {:.6f} M".format(total_params))
 
     print(args.num_warmup_updates)
+    project_root = Path(__file__).resolve().parents[2]
+    checkpoint_dir = project_root / "ckpts" / args.exp_name
+
     trainer = Trainer(
         model,
         args,
@@ -44,7 +47,7 @@ def main():
         args.learning_rate,
         num_warmup_updates=args.num_warmup_updates,
         save_per_updates=args.save_per_updates,
-        checkpoint_path=str(files("src").joinpath(f"../../ckpts/{args.exp_name}")),
+        checkpoint_path=str(checkpoint_dir),
         grad_accumulation_steps=args.grad_accumulation_steps,
         max_grad_norm=args.max_grad_norm,
         wandb_project="meanvc",

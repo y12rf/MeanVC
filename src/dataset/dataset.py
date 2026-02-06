@@ -1,3 +1,4 @@
+import os
 import torch
 from torch.utils.data import DataLoader
 import random
@@ -28,6 +29,8 @@ class DiffusionDataset(torch.utils.data.Dataset):
         self.feature_list = feature_list
         self.additional_feature_list = additional_feature_list
         self.pad_values = [float(x) for x in feature_pad_values]
+        self.max_retries = int(os.getenv("MEANVC_DATA_MAX_RETRIES", "50"))
+        self._bad_items = set()
 
         random.seed(42)
 
@@ -167,14 +170,25 @@ class DiffusionDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         idx = index
-        while True:
+        last_err = None
+        for _ in range(self.max_retries):
             try:
                 item = self.get_triple(self.file_lst[idx])
 
                 return item
             except Exception as e:
+                last_err = e
+                if os.getenv("MEANVC_DATA_DEBUG") == "1":
+                    bad_item = self.file_lst[idx]
+                    if bad_item not in self._bad_items:
+                        self._bad_items.add(bad_item)
+                        print(f"[DATA] skip item: {bad_item} err: {e}")
                 idx = random.randint(0, self.__len__() - 1)
                 continue
+        raise RuntimeError(
+            f"Failed to load a valid sample after {self.max_retries} attempts. "
+            f"Last error: {last_err}"
+        )
 
     def __len__(self):
         return len(self.file_lst)

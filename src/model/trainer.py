@@ -69,6 +69,7 @@ class Trainer:
             gradient_accumulation_steps=grad_accumulation_steps,
             **accelerate_kwargs,
         )
+        print(f"Training device: {self.accelerator.device}")
 
         if logger == "wandb":
             if exists(wandb_resume_id):
@@ -187,7 +188,7 @@ class Trainer:
 
     def get_dataloader(self):
         dd = DiffusionDataset(
-            *DiffusionDataset.init_data(self.args.dataset_path),
+            DiffusionDataset.init_data(self.args.dataset_path),
             feature_list=self.args.feature_list,
             additional_feature_list=self.args.additional_feature_list,
             feature_pad_values=self.args.feature_pad_values,
